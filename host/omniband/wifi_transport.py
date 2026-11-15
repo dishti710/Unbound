@@ -155,9 +155,11 @@ class UnifiedGestureEngine:
         self,
         on_action: Optional[Callable[[str, Any], None]] = None,
         on_badge: Optional[Callable[[str], None]] = None,
+        enable_piezo_clicks: bool = True,
     ) -> None:
         self.on_action = on_action  # ("click", "left"), ("mouse_down", "left"), ("scroll", 3), etc.
         self.on_badge = on_badge    # "⚡ GESTURE: JAW HOLD (DRAGGING...)"
+        self.enable_piezo_clicks = enable_piezo_clicks
         self._lock = threading.Lock()
 
         # Jaw Clench / Tap / Hold state
@@ -181,6 +183,40 @@ class UnifiedGestureEngine:
         self._last_nod_t = 0.0
         self._prev_mpu_pitch = 0.0
 
+        # Profile & Gaming Modes ("desktop" or "nfs")
+        self.profile: str = "desktop"
+        self._nfs_gas_held: bool = False
+        self._nfs_brake_held: bool = False
+        self._nfs_steer_left_held: bool = False
+        self._nfs_steer_right_held: bool = False
+        self._nfs_handbrake_held: bool = False
+
+    def set_profile(self, profile: str) -> None:
+        """Switch active gesture mapping profile ('desktop' or 'nfs')."""
+        with self._lock:
+            old_profile = self.profile
+            self.profile = profile.strip().lower()
+            if old_profile == "nfs" and self.profile != "nfs":
+                self.reset_nfs_keys()
+
+    def reset_nfs_keys(self) -> None:
+        """Release all held keys when leaving NFS gaming mode."""
+        if self._nfs_gas_held:
+            self._nfs_gas_held = False
+            self.trigger_action("key_up", "w", "🏎️ [NFS] GAS: RELEASED")
+        if self._nfs_brake_held:
+            self._nfs_brake_held = False
+            self.trigger_action("key_up", "s", "🏎️ [NFS] BRAKE: RELEASED")
+        if self._nfs_steer_left_held:
+            self._nfs_steer_left_held = False
+            self.trigger_action("key_up", "a", "◀️ [NFS] STEER: STRAIGHT")
+        if self._nfs_steer_right_held:
+            self._nfs_steer_right_held = False
+            self.trigger_action("key_up", "d", "▶️ [NFS] STEER: STRAIGHT")
+        if self._nfs_handbrake_held:
+            self._nfs_handbrake_held = False
+            self.trigger_action("key_up", "space", "🏎️ [NFS] HANDBRAKE: RELEASED")
+
     def trigger_action(self, action_type: str, param: Any, badge_text: str) -> None:
         if self.on_badge:
             try:
@@ -198,6 +234,10 @@ class UnifiedGestureEngine:
             now = time.perf_counter()
 
         with self._lock:
+            if not self.enable_piezo_clicks:
+                # Piezo is VISUAL TELEMETRY ONLY. Disconnected from OS clicks/keys.
+                return
+
             # Check pending single tap timeout
             if self._single_tap_pending and now >= self._single_tap_deadline:
                 self._single_tap_pending = False
@@ -230,7 +270,33 @@ class UnifiedGestureEngine:
             # Hold >450ms → Drag Lock (mouse_down) / release → mouse_up
             JAW_THRESH = 0.25   # tune on real hardware: lower = more sensitive
             jaw_is_high = (ch_temple_l > JAW_THRESH) or (ch_temple_r > JAW_THRESH)
+            BROW_THRESH = 0.25
+            brow_is_high = (ch_forehead > BROW_THRESH)
 
+            # -------------------------------------------------------------
+            # PROFILE: NFS MOST WANTED (W/A/S/D/SPACE Driving Mode)
+            # -------------------------------------------------------------
+            if self.profile == "nfs":
+                # Gas / Accelerate ('w'): Clench Jaw (hold)
+                if jaw_is_high and not self._nfs_gas_held:
+                    self._nfs_gas_held = True
+                    self.trigger_action("key_down", "w", "🏎️ [NFS] GAS: W (ACCELERATING)")
+                elif not jaw_is_high and self._nfs_gas_held:
+                    self._nfs_gas_held = False
+                    self.trigger_action("key_up", "w", "🏎️ [NFS] GAS: W (COASTING)")
+
+                # Brake / Reverse ('s'): Forehead / Brow Raise (hold)
+                if brow_is_high and not self._nfs_brake_held:
+                    self._nfs_brake_held = True
+                    self.trigger_action("key_down", "s", "🛑 [NFS] BRAKE: S (BRAKING)")
+                elif not brow_is_high and self._nfs_brake_held:
+                    self._nfs_brake_held = False
+                    self.trigger_action("key_up", "s", "🏎️ [NFS] BRAKE: S (RELEASED)")
+                return
+
+            # -------------------------------------------------------------
+            # PROFILE: DESKTOP MOUSE NAVIGATION
+            # -------------------------------------------------------------
             if jaw_is_high and not self._jaw_active:
                 self._jaw_active = True
                 self._jaw_press_t = now
@@ -276,6 +342,10 @@ class UnifiedGestureEngine:
             now = time.perf_counter()
 
         with self._lock:
+            if self.profile == "nfs":
+                # Completely bypass IMU in NFS mode so head movements never disrupt steering/cursor!
+                return
+
             if self._single_tap_pending and now >= self._single_tap_deadline:
                 self._single_tap_pending = False
                 self._tap_count = 0
@@ -301,6 +371,47 @@ class UnifiedGestureEngine:
             now = time.perf_counter()
 
         with self._lock:
+            if self.profile == "nfs":
+                # ---------------------------------------------------------
+                # NFS OPTICAL STEERING (A/D) & HANDBRAKE (SPACE)
+                # ---------------------------------------------------------
+                if left_ear is not None and right_ear is not None:
+                    # Steer Left ('a') via Left Eye Wink/Close (hold)
+                    l_closed = (left_ear < 0.22) and (right_ear >= 0.20)
+                    if l_closed and not self._nfs_steer_left_held:
+                        self._nfs_steer_left_held = True
+                        self.trigger_action("key_down", "a", "◀️ [NFS] STEER LEFT: A (HELD)")
+                    elif not l_closed and self._nfs_steer_left_held:
+                        self._nfs_steer_left_held = False
+                        self.trigger_action("key_up", "a", "◀️ [NFS] STEER: STRAIGHT")
+
+                    # Steer Right ('d') via Right Eye Wink/Close (hold)
+                    r_closed = (right_ear < 0.22) and (left_ear >= 0.20)
+                    if r_closed and not self._nfs_steer_right_held:
+                        self._nfs_steer_right_held = True
+                        self.trigger_action("key_down", "d", "▶️ [NFS] STEER RIGHT: D (HELD)")
+                    elif not r_closed and self._nfs_steer_right_held:
+                        self._nfs_steer_right_held = False
+                        self.trigger_action("key_up", "d", "▶️ [NFS] STEER: STRAIGHT")
+
+                # Handbrake ('space') via Smile
+                smile_active = (smile >= 0.35)
+                if smile_active and not self._nfs_handbrake_held:
+                    self._nfs_handbrake_held = True
+                    self.trigger_action("key_down", "space", "⚡ [NFS] HANDBRAKE: SPACE (HELD)")
+                elif not smile_active and self._nfs_handbrake_held:
+                    self._nfs_handbrake_held = False
+                    self.trigger_action("key_up", "space", "🏎️ [NFS] HANDBRAKE: RELEASED")
+
+                # Fallback optical brow raise for Brake ('s')
+                if brow >= 0.40 and not self._nfs_brake_held:
+                    self._nfs_brake_held = True
+                    self.trigger_action("key_down", "s", "🛑 [NFS] BRAKE: S (HELD)")
+                elif brow < 0.25 and self._nfs_brake_held:
+                    self._nfs_brake_held = False
+                    self.trigger_action("key_up", "s", "🏎️ [NFS] BRAKE: RELEASED")
+                return
+
             if self._single_tap_pending and now >= self._single_tap_deadline:
                 self._single_tap_pending = False
                 self._tap_count = 0
@@ -357,6 +468,12 @@ class UnifiedGestureEngine:
 
         g = (gesture_name or "").strip().upper()
         with self._lock:
+            if self.profile == "nfs":
+                if g in ("RIGHT", "DOUBLE", "DOUBLE_CLENCH", "JAW_TAP", "TAP"):
+                    self.trigger_action("key_down", "space", "⚡ [NFS] HANDBRAKE (SPACE PULSE)")
+                    threading.Timer(0.25, lambda: self.trigger_action("key_up", "space", "🏎️ [NFS] READY")).start()
+                return
+
             if g in ("CLICK", "LEFT", "JAW_CLENCH"):
                 self.trigger_action("click", "left", "⚡ GESTURE: JAW CLENCH (LEFT CLICK)")
             elif g in ("RIGHT", "DOUBLE", "DOUBLE_CLENCH", "JAW_TAP", "TAP"):
@@ -376,6 +493,8 @@ class UnifiedGestureEngine:
         if now is None:
             now = time.perf_counter()
         with self._lock:
+            if self.profile == "nfs":
+                return
             if self._single_tap_pending and now >= self._single_tap_deadline:
                 self._single_tap_pending = False
                 self._tap_count = 0
@@ -398,6 +517,7 @@ class OmniBandWifiClient:
         on_status_change: Optional[Callable[[str], None]] = None,
         on_gesture_action: Optional[Callable[[str, Any], None]] = None,
         on_gesture_badge: Optional[Callable[[str], None]] = None,
+        on_imu_telemetry: Optional[Callable[[float, float, float, float], None]] = None,
     ) -> None:
         self.port = port
         self.esp_ip = esp_ip
@@ -408,10 +528,12 @@ class OmniBandWifiClient:
         self.on_connection_change = on_connection_change
         self.on_metrics_update = on_metrics_update
         self.on_status_change = on_status_change
+        self.on_imu_telemetry = on_imu_telemetry
 
         self.gesture_engine = UnifiedGestureEngine(
             on_action=on_gesture_action,
             on_badge=on_gesture_badge,
+            enable_piezo_clicks=False,  # Piezo = Visual Telemetry Only (No OS clicks from piezo)
         )
 
         self._running = False
@@ -585,22 +707,26 @@ class OmniBandWifiClient:
             if (abs(dx) > 0.001 or abs(dy) > 0.001) and self.on_imu_motion:
                 self.on_imu_motion(dx, dy)
 
-            # Route inline gesture/click/scroll if present
+            # Route complete IMU telemetry (dx, dy, pitch, roll) to subscribers (e.g. NFS racing engine)
+            if self.on_imu_telemetry:
+                self.on_imu_telemetry(dx, dy, pitch, roll)
+
+            # Route inline gesture/click/scroll if present (Piezo is visual telemetry only: no OS clicks)
             click = pkt.get("click", "none")
             if click and click not in ("none", ""):
-                self.gesture_engine.feed_gesture(click)
+                # self.gesture_engine.feed_gesture(click)  # Disabled: Piezo visual telemetry only
                 if self.on_hardware_gesture:
                     self.on_hardware_gesture(click.upper())
 
             scroll = pkt.get("scroll", 0)
             if scroll != 0:
-                self.gesture_engine.feed_gesture("SCROLL_UP" if scroll > 0 else "SCROLL_DOWN")
+                # self.gesture_engine.feed_gesture("SCROLL_UP" if scroll > 0 else "SCROLL_DOWN")
                 if self.on_hardware_gesture:
                     self.on_hardware_gesture(f"SCROLL_{'UP' if scroll > 0 else 'DOWN'}")
 
             gesture = pkt.get("gesture", "")
             if gesture and gesture not in ("NONE", ""):
-                self.gesture_engine.feed_gesture(gesture)
+                # self.gesture_engine.feed_gesture(gesture)
                 if self.on_hardware_gesture:
                     self.on_hardware_gesture(gesture.upper())
 

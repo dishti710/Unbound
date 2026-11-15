@@ -52,6 +52,8 @@ from host.omniband.hardware.ble_client import OmniBandBleClient
 from host.omniband.hardware.hardware_calibration import HardwareCalibrator
 from host.omniband.tracking.optical_calibration import OpticalCalibrator, OpticalCalibrationProfile
 from host.omniband.app.text_focus_watcher import TextFocusWatcher
+from host.omniband.nfs_controller import NFSRacingController
+from host.omniband.app.nfs_overlay import NFSMiniOverlay
 from host.omniband.app.touch_keyboard import (
     show_microsoft_keyboard,
     hide_microsoft_keyboard,
@@ -134,6 +136,7 @@ class MainWindow(QMainWindow):
         self.invert_mpu_x: bool = True
         self.invert_mpu_y: bool = True
         self.swap_mpu_xy: bool = False
+        self.nfs_mode: bool = False
         self._load_mpu_config()
 
         self._badge_revert_timer = QTimer(self)
@@ -165,6 +168,23 @@ class MainWindow(QMainWindow):
         from gateway import Gateway, SendInputBackend
         self.gw = Gateway(SendInputBackend())
         self.gw.install_exit_handlers()
+
+        # DirectInput NFS Racing Controller & Compact Always-on-Top Mini Overlay
+        self.hardware_mpu_disabled: bool = False
+        self._failover_blink_timestamps: list[float] = []
+
+        self.nfs_controller = NFSRacingController(
+            gateway=self.gw,
+            on_telemetry=self._on_nfs_telemetry,
+        )
+        self.nfs_overlay = NFSMiniOverlay(
+            on_zero=self.nfs_controller.zero_gyro,
+            on_exit=self._exit_nfs_mode,
+            on_toggle_fallback=self._toggle_mpu_fallback,
+        )
+        self._nfs_tick_timer = QTimer(self)
+        self._nfs_tick_timer.setInterval(16)
+        self._nfs_tick_timer.timeout.connect(self._on_nfs_tick)
         if hasattr(self, "_chk_allow_all"):
             self.gw.process_gate.allow_all = self._chk_allow_all.isChecked()
             self._chk_allow_all.toggled.connect(lambda chk: setattr(self.gw.process_gate, "allow_all", chk))
@@ -182,6 +202,7 @@ class MainWindow(QMainWindow):
             on_latch_changed=self._on_latch_state_changed,
             on_universal_exit=self._on_universal_exit,
             on_head_mouse_toggled=lambda en: self.sig_head_mouse_toggled.emit(en),
+            on_blink=self._on_webcam_blink_event,
             optical_calibrator=self.optical_calibrator,
         )
         # Default head-mouse OFF at startup (enable via F11 or 4x Blink)
@@ -267,6 +288,7 @@ class MainWindow(QMainWindow):
             on_status_change=lambda msg: self.sig_hw_status.emit(msg),
             on_gesture_action=self._on_gesture_engine_action,
             on_gesture_badge=self._on_gesture_badge_update,
+            on_imu_telemetry=self._on_wifi_imu_telemetry,
         )
         self.wifi_client.start()
 
@@ -724,6 +746,46 @@ class MainWindow(QMainWindow):
         mpu_ctrl_row.addStretch()
         layout.addLayout(mpu_ctrl_row)
 
+        # Gaming Profile Row: NFS Most Wanted / Racing Controls
+        gaming_profile_row = QHBoxLayout()
+        gaming_profile_row.setSpacing(10)
+        self._btn_nfs_mode = QPushButton("🏎️ NFS OVERLAY MODE (Compact Mini HUD)")
+        self._btn_nfs_mode.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._btn_nfs_mode.setStyleSheet("""
+            QPushButton {
+                background-color: #22140a;
+                color: #FF6600;
+                border: 2px solid #FF6600;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover {
+                background-color: #3b1e0f;
+            }
+        """)
+        self._btn_nfs_mode.clicked.connect(self._toggle_nfs_mode)
+        gaming_profile_row.addWidget(self._btn_nfs_mode)
+
+        self._btn_fallback_toggle = QPushButton("🔄 MPU + BLINK <-> NOSE FALLBACK")
+        self._btn_fallback_toggle.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._btn_fallback_toggle.setStyleSheet("""
+            QPushButton {
+                background-color: #0d2818;
+                color: #00FF66;
+                border: 2px solid #00FF66;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover {
+                background-color: #143d24;
+            }
+        """)
+        self._btn_fallback_toggle.clicked.connect(self._toggle_mpu_fallback)
+        gaming_profile_row.addWidget(self._btn_fallback_toggle)
+
+        gaming_profile_row.addStretch()
+        layout.addLayout(gaming_profile_row)
+
         # Calibration Matrix Displays (from self.calib)
         matrix_box = QVBoxLayout()
         matrix_box.setSpacing(4)
@@ -861,15 +923,16 @@ class MainWindow(QMainWindow):
 
     def _on_cursor_tick(self) -> None:
         """Consistent 60 FPS delta-velocity cursor integration loop."""
-        if not self.webcam_tracker.head_mouse_enabled or self._is_racing_game():
+        if getattr(self, "nfs_mode", False) or self._is_racing_game():
+            return  # Optical cursor disabled in racing mode!
+        if not self.webcam_tracker.head_mouse_enabled:
             return
 
         now = time.perf_counter()
         hw_connected = (hasattr(self, "wifi_client") and self.wifi_client.is_connected) or (hasattr(self, "ble_client") and self.ble_client.is_connected)
-        if hw_connected and getattr(self, "_mpu_detected", False):
-            return  # Hardware MPU is primary cursor — suppress optical head-mouse to avoid fighting!
-        if hw_connected and (now - getattr(self, "_last_mpu_motion_time", 0.0) < 2.0):
-            return  # MPU recently active — suppress optical head-mouse!
+        if hw_connected and not getattr(self, "hardware_mpu_disabled", False):
+            if getattr(self, "_mpu_detected", False) or (now - getattr(self, "_last_mpu_motion_time", 0.0) < 1.0):
+                return  # MPU is healthy & driving cursor — suppress optical head-mouse!
 
         if now < self.webcam_tracker.freeze_until:
             return
@@ -979,6 +1042,8 @@ class MainWindow(QMainWindow):
             self._active_scroll_pitch = 0.0
 
     def _on_scroll_60hz_tick(self) -> None:
+        if getattr(self, "nfs_mode", False):
+            return  # Optical pitch scrolling disabled in NFS gaming mode!
         if self._active_scroll_pitch == 0.0:
             return
         deg = self._active_scroll_pitch
@@ -1293,7 +1358,7 @@ class MainWindow(QMainWindow):
             return
 
         proc = get_active_process_win32()
-        is_racing_game = self._is_racing_game(proc)
+        is_racing_game = getattr(self, "nfs_mode", False) or self._is_racing_game(proc)
 
         if ch in (1, 2) and not is_racing_game:
             return
@@ -1343,7 +1408,7 @@ class MainWindow(QMainWindow):
         now_str = time.strftime("%H:%M:%S")
 
         proc = get_active_process_win32()
-        is_racing_game = self._is_racing_game(proc)
+        is_racing_game = getattr(self, "nfs_mode", False) or self._is_racing_game(proc)
 
         from core.events import OutputCommand
         cmds = []
@@ -1599,6 +1664,123 @@ class MainWindow(QMainWindow):
         self._save_mpu_config()
         self.calib.append_log(f"MPU Inversion updated: InvX={self.invert_mpu_x}, InvY={self.invert_mpu_y}, SwapXY={self.swap_mpu_xy}")
 
+    def _enter_nfs_mode(self) -> None:
+        """Activate NFS Racing mode, hide bulky main dashboard, show compact mini overlay."""
+        self.nfs_mode = True
+        if hasattr(self, "nfs_controller"):
+            self.nfs_controller.enable()
+        if hasattr(self, "_nfs_tick_timer"):
+            self._nfs_tick_timer.start(16)
+        if hasattr(self, "wifi_client"):
+            self.wifi_client.gesture_engine.set_profile("nfs")
+        if hasattr(self, "_btn_nfs_mode"):
+            self._btn_nfs_mode.setText("🏎️ NFS OVERLAY ACTIVE (Click to Exit)")
+        self.hide()
+        if hasattr(self, "nfs_overlay"):
+            self.nfs_overlay.show()
+        self.calib.append_log("🏎️ NFS OVERLAY MODE ACTIVATED: Auto-Gas ON, Proportional PWM Steering ON, Mini Overlay Visible")
+
+    def _exit_nfs_mode(self) -> None:
+        """Deactivate NFS Racing mode, hide overlay, release all keys, restore main HUD."""
+        self.nfs_mode = False
+        if hasattr(self, "_nfs_tick_timer"):
+            self._nfs_tick_timer.stop()
+        if hasattr(self, "nfs_controller"):
+            self.nfs_controller.disable()
+        if hasattr(self, "wifi_client"):
+            self.wifi_client.gesture_engine.set_profile("desktop")
+        self.gw.release_all_keys()
+        if hasattr(self, "nfs_overlay"):
+            self.nfs_overlay.hide()
+        if hasattr(self, "_btn_nfs_mode"):
+            self._btn_nfs_mode.setText("🏎️ NFS OVERLAY MODE (Compact Mini HUD)")
+        self.showNormal()
+        self.activateWindow()
+        self.calib.append_log("🖥️ NFS OVERLAY MODE EXITED: Restored Main HUD, all driving keys released")
+
+    def _toggle_nfs_mode(self) -> None:
+        if getattr(self, "nfs_mode", False):
+            self._exit_nfs_mode()
+        else:
+            self._enter_nfs_mode()
+
+    def _on_nfs_tick(self) -> None:
+        if getattr(self, "nfs_mode", False) and hasattr(self, "nfs_controller"):
+            self.nfs_controller.tick(time.perf_counter())
+
+    def _on_nfs_telemetry(self, gas: bool, brake: bool, steer_left: bool, steer_right: bool, nos: bool, drift: bool) -> None:
+        if hasattr(self, "nfs_overlay") and self.nfs_overlay.isVisible():
+            self.nfs_overlay.update_telemetry(gas, brake, steer_left, steer_right, nos, drift)
+
+    def _on_webcam_blink_event(self, now: float) -> None:
+        """Track rapid blinks from the existing blink detector (5 blinks within 3.0 seconds)."""
+        self._failover_blink_timestamps.append(now)
+        self._failover_blink_timestamps = [t for t in self._failover_blink_timestamps if now - t <= 3.0]
+        if len(self._failover_blink_timestamps) >= 5:
+            self._failover_blink_timestamps.clear()
+            self._set_hardware_mpu_disabled(True, reason="5 Rapid Blinks within 3.0s")
+
+    def _set_hardware_mpu_disabled(self, disabled: bool, reason: str = "") -> None:
+        """Set MPU disable flag and switch cursor movement between MPU and Nose tracking."""
+        self.hardware_mpu_disabled = disabled
+        if disabled:
+            if hasattr(self, "webcam_tracker"):
+                self.webcam_tracker.head_mouse_enabled = True
+                self._on_head_mouse_toggled(True)
+            self.status.showMessage("🟣 FALLBACK ACTIVE: NOSE + BLINK MODE (MPU Disabled)", 4000)
+            self.calib.append_log(f"🟣 [FAILOVER] Switched cursor to Nose Tracking ({reason})")
+        else:
+            self.status.showMessage("🟢 HYBRID ACTIVE: MPU + BLINK MODE", 4000)
+            self.calib.append_log(f"🟢 [HYBRID] Restored Hardware MPU cursor movement ({reason})")
+
+        self._update_fallback_toggle_ui()
+        self._update_tier_badge()
+        if hasattr(self, "nfs_overlay") and self.nfs_overlay.isVisible():
+            self.nfs_overlay.set_fallback_mode(disabled)
+
+    def _toggle_mpu_fallback(self) -> None:
+        """1-click toggle between Hybrid MPU mode and Optical Nose Fallback mode."""
+        self._set_hardware_mpu_disabled(not self.hardware_mpu_disabled, reason="1-Click Mode Toggle")
+
+    def _update_fallback_toggle_ui(self) -> None:
+        if hasattr(self, "_btn_fallback_toggle"):
+            if self.hardware_mpu_disabled:
+                self._btn_fallback_toggle.setText("🟣 NOSE FALLBACK ACTIVE (Click for MPU)")
+                self._btn_fallback_toggle.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2a0033;
+                        color: #D500F9;
+                        border: 2px solid #D500F9;
+                        border-radius: 4px;
+                        padding: 6px 14px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #3d0049;
+                    }
+                """)
+            else:
+                self._btn_fallback_toggle.setText("🔄 MPU + BLINK <-> NOSE FALLBACK")
+                self._btn_fallback_toggle.setStyleSheet("""
+                    QPushButton {
+                        background-color: #0d2818;
+                        color: #00FF66;
+                        border: 2px solid #00FF66;
+                        border-radius: 4px;
+                        padding: 6px 14px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #143d24;
+                    }
+                """)
+
+    def _on_wifi_imu_telemetry(self, dx: float, dy: float, pitch: float, roll: float) -> None:
+        if getattr(self, "hardware_mpu_disabled", False):
+            return  # MPU motion ignored in 5-blink fallback mode
+        if getattr(self, "nfs_mode", False) and hasattr(self, "nfs_controller"):
+            self.nfs_controller.feed_imu(dx, dy, pitch, roll)
+
     def _revert_gesture_badge(self) -> None:
         if hasattr(self, "_lbl_active_gesture_badge"):
             self._lbl_active_gesture_badge.setText("⚡ GESTURE: READY")
@@ -1724,7 +1906,25 @@ class MainWindow(QMainWindow):
             ))
             self.calib.append_log(f"⚡ [GESTURE ENGINE] Key: {key_name.upper()} (Enter/Confirm)")
 
+        elif action_type == "key_down":
+            key_name = str(param)
+            self.gw.apply([OutputCommand(kind="key", name=key_name, pressed=True)])
+            self.gw.flush(now)
+            self.calib.append_log(f"🏎️ [NFS GAMING] Key DOWN: {key_name.upper()}")
+
+        elif action_type == "key_up":
+            key_name = str(param)
+            self.gw.apply([OutputCommand(kind="key", name=key_name, pressed=False)])
+            self.gw.flush(now)
+            self.calib.append_log(f"🏎️ [NFS GAMING] Key UP: {key_name.upper()}")
+
     def _on_imu_motion_event(self, dx: float, dy: float) -> None:
+        if getattr(self, "nfs_mode", False) or (hasattr(self, "wifi_client") and getattr(self.wifi_client.gesture_engine, "profile", "desktop") == "nfs"):
+            return  # MPU motion muted in NFS Gaming Mode!
+
+        if getattr(self, "hardware_mpu_disabled", False):
+            return  # 5-Blink Failover Active: Ignore Wi-Fi MPU6050 movement!
+
         if getattr(self, "swap_mpu_xy", False):
             dx, dy = dy, dx
         if getattr(self, "invert_mpu_x", True):
@@ -1789,6 +1989,8 @@ class MainWindow(QMainWindow):
         self.calib.set_ble_metrics(self.ble_client.is_connected, f"OmniBand-{transport}", rssi, rate)
 
     def _on_ble_frame_event(self, ch_vals: list[float], active: list[bool], seq: int) -> None:
+        if getattr(self, "nfs_mode", False) and hasattr(self, "nfs_controller"):
+            self.nfs_controller.feed_somatic(ch_vals)
         try:
             # Feed calibration wizard if active
             self.calib.feed_sample(ch_vals)
@@ -1810,19 +2012,18 @@ class MainWindow(QMainWindow):
                     self._pill_ch4.setStyleSheet(f"background: {SURFACE_2}; color: {STATUS_ERR}; font-weight: bold; border: 1px solid {BORDER}; padding: 4px 6px; border-radius: 4px; font-family: 'Cascadia Code', monospace; font-size: 10px;")
                     self._lbl_jaw_diagnostic.setText("Jaw Clench: Idle | 1 kHz Edge DSP Spike Detector: Active")
 
-            # Dispatch physical edges for each active channel
-            if not hasattr(self, "_last_ble_active"):
-                self._last_ble_active = [False, False, False, False]
-
-            for i in range(4):
-                act = active[i]
-                if act != self._last_ble_active[i]:
-                    self._last_ble_active[i] = act
-                    self._on_physical_edge(i + 1, act, ch_vals[i])
+            # Physical edge dispatch disabled: Piezo is VISUAL TELEMETRY ONLY (No OS clicks from piezo)
+            # Oscilloscope, calibration collector, and live channel status pills above continue updating cleanly.
         except Exception:
             pass
 
     def _update_tier_badge(self) -> None:
+        if getattr(self, "hardware_mpu_disabled", False):
+            self._lbl_tier.setText("🟣 FALLBACK ACTIVE: NOSE + BLINK MODE")
+            self._lbl_tier.setStyleSheet(f"color: #D500F9; font-weight: bold; padding: 4px 8px; border-radius: 4px; background: {SURFACE_2}; border: 1px solid #D500F9;")
+            self._lbl_hw_mpu_pill.setText("Cursor Motion: Nose-Tracking Optical Fallback (MPU Muted)")
+            return
+
         wifi_on = hasattr(self, "wifi_client") and self.wifi_client.is_connected
         hw_on = wifi_on or self.ble_client.is_connected
         transport = "Wi-Fi UDP" if wifi_on else getattr(self.ble_client, "transport_type", "BLE")
@@ -1831,7 +2032,7 @@ class MainWindow(QMainWindow):
         opt_on = self.webcam_tracker.head_mouse_enabled and self.webcam_tracker.is_alive()
 
         if hw_on and mpu_active:
-            self._lbl_tier.setText(f"ACTIVE: TIER 1 ({transport} MPU CURSOR)")
+            self._lbl_tier.setText(f"🟢 HYBRID ACTIVE: MPU + BLINK MODE ({transport})")
             self._lbl_tier.setStyleSheet(f"color: {STATUS_OK}; font-weight: bold; padding: 4px 8px; border-radius: 4px; background: {SURFACE_2}; border: 1px solid {BORDER};")
             self._lbl_hw_mpu_pill.setText(f"Cursor Motion: Hardware MPU6050 ({transport})")
         elif hw_on and opt_on:
@@ -2131,6 +2332,10 @@ class MainWindow(QMainWindow):
 
     def _stop_workers(self) -> None:
         self._emergency_release_all()
+        if hasattr(self, "nfs_controller"):
+            self.nfs_controller.disable()
+        if hasattr(self, "nfs_overlay"):
+            self.nfs_overlay.close()
         for attr in ("webcam_tracker", "key_poller", "watcher", "focus_watcher", "ble_client", "wifi_client"):
             obj = getattr(self, attr, None)
             if obj and hasattr(obj, "stop"):
@@ -2138,7 +2343,7 @@ class MainWindow(QMainWindow):
                     obj.stop()
                 except Exception:
                     pass
-        for timer_attr in ("_cursor_timer", "_scroll_timer"):
+        for timer_attr in ("_cursor_timer", "_scroll_timer", "_nfs_tick_timer"):
             t = getattr(self, timer_attr, None)
             if t and hasattr(t, "stop"):
                 try:
